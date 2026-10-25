@@ -1,0 +1,963 @@
+-- Door & Item ESP Menu (LocalScript in StarterPlayer > StarterPlayerScripts)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- Settings & defaults
+---------------------------------------------------------------------
+local DOOR_NAME = "HalloweenDoor"
+local ITEM_FOLDER_NAMES = { "Items", "items" } -- Workspace.Items (both spellings)
+local MAX_ITEM_HIGHLIGHTS = 20 -- Roblox only renders ~31 highlights at once
+
+local COLORS = {
+	{ name = "Orange", color = Color3.fromRGB(255, 120, 0) },
+	{ name = "Red", color = Color3.fromRGB(255, 50, 50) },
+	{ name = "Green", color = Color3.fromRGB(60, 220, 90) },
+	{ name = "Blue", color = Color3.fromRGB(60, 140, 255) },
+	{ name = "Purple", color = Color3.fromRGB(170, 80, 255) },
+	{ name = "Yellow", color = Color3.fromRGB(255, 220, 40) },
+	{ name = "White", color = Color3.fromRGB(255, 255, 255) },
+}
+local NEAREST_COLOR = Color3.fromRGB(0, 255, 200)
+
+local GREEN = Color3.fromRGB(40, 170, 70)
+local RED = Color3.fromRGB(170, 45, 45)
+local ACCENT = Color3.fromRGB(255, 120, 0)
+local NEUTRAL = Color3.fromRGB(60, 60, 72)
+
+-- Change these to set what is on when you join
+local DEFAULTS = {
+	-- Doors
+	doorEspEnabled = true,
+	counterEnabled = true,
+	doorTracersEnabled = true,
+	doorDistanceEnabled = false,
+	nearestEnabled = false,
+	notifyEnabled = true,
+	doorColorIndex = 1,
+	-- Items
+	itemEspEnabled = false,
+	itemNamesEnabled = true,
+	itemTracersEnabled = false,
+	itemCounterEnabled = true,
+	itemColorIndex = 6,
+	-- Prompts
+	instantPromptEnabled = false,
+	-- Visuals (no menu tab, change here)
+	fillTransparency = 0.15,
+	tracerOrigin = "Center", -- "Center", "Bottom", "Top" or "Mouse"
+	tracerThickness = 2,
+	-- Menu
+	menuKey = "RightShift",
+}
+
+local settings = table.clone(DEFAULTS)
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+local function addCorner(obj, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius or 8)
+	corner.Parent = obj
+end
+
+local function styleText(obj, size)
+	obj.Font = Enum.Font.GothamBold
+	obj.TextSize = size or 15
+	obj.TextColor3 = Color3.new(1, 1, 1)
+end
+
+local function getPart(obj)
+	if obj:IsA("BasePart") then return obj end
+	if obj:IsA("Model") and obj.PrimaryPart then return obj.PrimaryPart end
+	return obj:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getPosition(obj)
+	if obj:IsA("Model") then
+		return obj:GetPivot().Position
+	end
+	local part = getPart(obj)
+	return part and part.Position
+end
+
+-- True if the object is part of, carried by, or welded to any player's character
+local function isOnPlayer(obj)
+	local part = getPart(obj)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char then
+			if obj == char or obj:IsDescendantOf(char) then
+				return true
+			end
+			local root = char:FindFirstChild("HumanoidRootPart")
+			if part and root and part.AssemblyRootPart == root.AssemblyRootPart then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Extends a line from a start point in a direction until it hits the screen edge
+local function toScreenEdge(start, direction, viewport)
+	local tx, ty = math.huge, math.huge
+	if direction.X > 0 then
+		tx = (viewport.X - start.X) / direction.X
+	elseif direction.X < 0 then
+		tx = -start.X / direction.X
+	end
+	if direction.Y > 0 then
+		ty = (viewport.Y - start.Y) / direction.Y
+	elseif direction.Y < 0 then
+		ty = -start.Y / direction.Y
+	end
+	return start + direction * math.min(tx, ty)
+end
+
+-- Draws a tracer line (also works when the target is behind the camera)
+local function drawTracer(line, camera, viewport, origin, pos, color, thickness)
+	local screen = camera:WorldToViewportPoint(pos)
+	local target
+	if screen.Z > 0 then
+		target = Vector2.new(screen.X, screen.Y)
+	else
+		local rel = camera.CFrame:PointToObjectSpace(pos)
+		local direction = Vector2.new(rel.X, -rel.Y)
+		if direction.Magnitude < 0.001 then
+			direction = Vector2.new(0, 1)
+		end
+		target = toScreenEdge(origin, direction.Unit, viewport)
+	end
+
+	local diff = target - origin
+	local middle = (origin + target) / 2
+	line.Size = UDim2.fromOffset(diff.Magnitude, thickness)
+	line.Position = UDim2.fromOffset(middle.X, middle.Y)
+	line.Rotation = math.deg(math.atan2(diff.Y, diff.X))
+	line.BackgroundColor3 = color
+	line.Visible = true
+end
+
+---------------------------------------------------------------------
+-- Base GUI (tracer layer, counter, notifications)
+---------------------------------------------------------------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ESPGui"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+local tracerLayer = Instance.new("Frame")
+tracerLayer.Size = UDim2.fromScale(1, 1)
+tracerLayer.BackgroundTransparency = 1
+tracerLayer.Parent = screenGui
+
+local counter = Instance.new("TextLabel")
+counter.Size = UDim2.fromOffset(210, 0)
+counter.AutomaticSize = Enum.AutomaticSize.Y
+counter.Position = UDim2.new(0, 15, 0.4, 0)
+counter.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+counter.BackgroundTransparency = 0.2
+counter.TextXAlignment = Enum.TextXAlignment.Left
+styleText(counter, 16)
+counter.Parent = screenGui
+addCorner(counter)
+
+local counterPadding = Instance.new("UIPadding")
+counterPadding.PaddingLeft = UDim.new(0, 10)
+counterPadding.PaddingTop = UDim.new(0, 8)
+counterPadding.PaddingBottom = UDim.new(0, 8)
+counterPadding.Parent = counter
+
+local counterStroke = Instance.new("UIStroke")
+counterStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+counterStroke.Thickness = 2
+counterStroke.Parent = counter
+
+local notification = Instance.new("TextLabel")
+notification.Size = UDim2.fromOffset(320, 40)
+notification.Position = UDim2.new(0.5, -160, 0, 70)
+notification.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+notification.BackgroundTransparency = 0.1
+notification.Visible = false
+styleText(notification, 16)
+notification.Parent = screenGui
+addCorner(notification)
+
+local notificationId = 0
+local function notify(text)
+	notificationId += 1
+	local id = notificationId
+	notification.Text = text
+	notification.Visible = true
+	task.delay(3, function()
+		if id == notificationId then
+			notification.Visible = false
+		end
+	end)
+end
+
+---------------------------------------------------------------------
+-- Prompts (Instant Prompt / No Instant Prompt)
+---------------------------------------------------------------------
+-- Every ProximityPrompt we have seen, with its normal hold duration
+local originalHold = setmetatable({}, { __mode = "k" }) -- [prompt] = normal HoldDuration
+local instantActive = false
+
+-- Puts a prompt into the correct state (instant or normal)
+local function applyPrompt(prompt)
+	local normal = originalHold[prompt]
+	if normal == nil then return end
+	local wanted = instantActive and 0 or normal
+	if prompt.HoldDuration ~= wanted then
+		prompt.HoldDuration = wanted
+	end
+end
+
+-- Starts tracking a prompt (existing or future)
+local function trackPrompt(obj)
+	if not obj:IsA("ProximityPrompt") or originalHold[obj] ~= nil then return end
+	originalHold[obj] = obj.HoldDuration
+
+	-- If the game changes the hold time later, remember it as the new normal value
+	obj:GetPropertyChangedSignal("HoldDuration"):Connect(function()
+		local value = obj.HoldDuration
+		if instantActive then
+			if value ~= 0 then
+				originalHold[obj] = value
+				obj.HoldDuration = 0
+			end
+		else
+			originalHold[obj] = value
+		end
+	end)
+
+	applyPrompt(obj)
+end
+
+local function countPrompts()
+	local count = 0
+	for prompt in pairs(originalHold) do
+		if prompt.Parent then count += 1 end
+	end
+	return count
+end
+
+local function setInstantPrompts(enabled)
+	if enabled == instantActive then return end
+	instantActive = enabled
+	for prompt in pairs(originalHold) do
+		applyPrompt(prompt)
+	end
+end
+
+-- Track all prompts that exist now and every prompt that appears later
+for _, obj in ipairs(workspace:GetDescendants()) do
+	trackPrompt(obj)
+end
+workspace.DescendantAdded:Connect(trackPrompt)
+
+---------------------------------------------------------------------
+-- Target tracking (doors & items)
+---------------------------------------------------------------------
+local targets = {} -- [object] = { kind, highlight, billboard, label, tracer, pos, dist }
+local doorScanDone = false
+
+local function refresh()
+	counter.Visible = settings.counterEnabled or (settings.itemEspEnabled and settings.itemCounterEnabled)
+	counterStroke.Color = COLORS[settings.doorColorIndex].color
+	setInstantPrompts(settings.instantPromptEnabled)
+end
+
+local function removeTarget(obj)
+	local data = targets[obj]
+	if not data then return end
+	data.highlight:Destroy()
+	data.billboard:Destroy()
+	data.tracer:Destroy()
+	targets[obj] = nil
+end
+
+local function addTarget(obj, kind)
+	if targets[obj] or isOnPlayer(obj) then return end
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "ESPHighlight"
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.OutlineTransparency = 0
+	highlight.Enabled = false
+	if obj:IsA("Model") or obj:IsA("BasePart") then
+		highlight.Adornee = obj
+	else
+		highlight.Adornee = getPart(obj)
+	end
+	highlight.Parent = obj
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.fromOffset(kind == "item" and 220 or 120, 24)
+	billboard.StudsOffset = Vector3.new(0, kind == "item" and 2.5 or 5, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Enabled = false
+	billboard.Adornee = getPart(obj)
+	billboard.Parent = screenGui
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.TextStrokeTransparency = 0.3
+	styleText(label, 14)
+	label.Parent = billboard
+
+	local tracer = Instance.new("Frame")
+	tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+	tracer.BorderSizePixel = 0
+	tracer.Visible = false
+	tracer.Parent = tracerLayer
+
+	targets[obj] = { kind = kind, highlight = highlight, billboard = billboard, label = label, tracer = tracer }
+
+	-- Opened / picked up / deleted -> remove
+	obj.AncestryChanged:Connect(function()
+		if not obj:IsDescendantOf(workspace) then
+			removeTarget(obj)
+		end
+	end)
+
+	if kind == "door" and doorScanDone and settings.notifyEnabled then
+		notify("🚪 New door appeared!")
+	end
+end
+
+---------------------------------------------------------------------
+-- Menu window
+---------------------------------------------------------------------
+local menuButton = Instance.new("TextButton")
+menuButton.Size = UDim2.fromOffset(44, 44)
+menuButton.Position = UDim2.new(0, 15, 0.4, -54)
+menuButton.BackgroundColor3 = ACCENT
+menuButton.Text = "🎃"
+styleText(menuButton, 24)
+menuButton.Parent = screenGui
+addCorner(menuButton, 10)
+
+local window = Instance.new("Frame")
+window.Size = UDim2.fromOffset(470, 360)
+window.Position = UDim2.new(0.5, -235, 0.5, -180)
+window.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+window.Parent = screenGui
+addCorner(window, 10)
+
+local titleBar = Instance.new("TextLabel")
+titleBar.Size = UDim2.new(1, 0, 0, 38)
+titleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+titleBar.Text = "   🎃 ESP Menu"
+titleBar.TextXAlignment = Enum.TextXAlignment.Left
+styleText(titleBar, 17)
+titleBar.Parent = window
+addCorner(titleBar, 10)
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.fromOffset(28, 28)
+closeButton.Position = UDim2.new(1, -33, 0, 5)
+closeButton.BackgroundColor3 = RED
+closeButton.Text = "X"
+styleText(closeButton, 14)
+closeButton.Parent = titleBar
+addCorner(closeButton, 6)
+
+local function toggleMenu()
+	window.Visible = not window.Visible
+end
+closeButton.MouseButton1Click:Connect(toggleMenu)
+menuButton.MouseButton1Click:Connect(toggleMenu)
+
+-- Make the window draggable
+local dragging, dragStart, startPos = false, nil, nil
+titleBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = window.Position
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+
+-- Tab bar (scrolls if the tabs don't fit)
+local tabBar = Instance.new("ScrollingFrame")
+tabBar.Size = UDim2.new(1, -20, 0, 32)
+tabBar.Position = UDim2.fromOffset(10, 46)
+tabBar.BackgroundTransparency = 1
+tabBar.BorderSizePixel = 0
+tabBar.ScrollBarThickness = 0
+tabBar.ScrollingDirection = Enum.ScrollingDirection.X
+tabBar.CanvasSize = UDim2.new()
+tabBar.AutomaticCanvasSize = Enum.AutomaticSize.X
+tabBar.Parent = window
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 6)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Parent = tabBar
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -20, 1, -96)
+content.Position = UDim2.fromOffset(10, 86)
+content.BackgroundTransparency = 1
+content.Parent = window
+
+local tabs = {}
+local function showTab(name)
+	for tabName, tab in pairs(tabs) do
+		tab.page.Visible = (tabName == name)
+		tab.button.BackgroundColor3 = (tabName == name) and ACCENT or Color3.fromRGB(50, 50, 60)
+	end
+end
+
+local function newTab(name, order)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0, 0, 1, 0)
+	button.AutomaticSize = Enum.AutomaticSize.X
+	button.LayoutOrder = order
+	button.Text = name
+	styleText(button, 13)
+	button.Parent = tabBar
+	addCorner(button, 6)
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.Parent = button
+
+	local page = Instance.new("ScrollingFrame")
+	page.Size = UDim2.fromScale(1, 1)
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel = 0
+	page.ScrollBarThickness = 4
+	page.CanvasSize = UDim2.new()
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.Visible = false
+	page.Parent = content
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+
+	tabs[name] = { button = button, page = page }
+	button.MouseButton1Click:Connect(function()
+		showTab(name)
+	end)
+	return page
+end
+
+---------------------------------------------------------------------
+-- Controls
+---------------------------------------------------------------------
+local updaters = {}
+local rowCount = 0
+
+local function redrawAll()
+	for _, update in ipairs(updaters) do update() end
+end
+
+local function newRow(page, text)
+	rowCount += 1
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -8, 0, 38)
+	row.BackgroundColor3 = Color3.fromRGB(42, 42, 50)
+	row.LayoutOrder = rowCount
+	row.Parent = page
+	addCorner(row, 6)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0.6, 0, 1, 0)
+	label.Position = UDim2.fromOffset(10, 0)
+	label.BackgroundTransparency = 1
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Text = text
+	styleText(label, 14)
+	label.Parent = row
+	return row
+end
+
+local function newInfo(page, text)
+	rowCount += 1
+	local info = Instance.new("TextLabel")
+	info.Size = UDim2.new(1, -8, 0, 40)
+	info.BackgroundTransparency = 1
+	info.TextWrapped = true
+	info.LayoutOrder = rowCount
+	info.Text = text
+	styleText(info, 13)
+	info.TextColor3 = Color3.fromRGB(170, 170, 180)
+	info.Parent = page
+	return info
+end
+
+local function newButton(row, width, x)
+	local button = Instance.new("TextButton")
+	button.AnchorPoint = Vector2.new(1, 0.5)
+	button.Size = UDim2.fromOffset(width, 28)
+	button.Position = UDim2.new(1, x or -6, 0.5, 0)
+	button.BackgroundColor3 = NEUTRAL
+	styleText(button, 14)
+	button.Parent = row
+	addCorner(button, 6)
+	return button
+end
+
+local function newToggle(page, text, key)
+	local button = newButton(newRow(page, text), 70)
+	local function update()
+		button.Text = settings[key] and "ON" or "OFF"
+		button.BackgroundColor3 = settings[key] and GREEN or RED
+	end
+	button.MouseButton1Click:Connect(function()
+		settings[key] = not settings[key]
+		update()
+		refresh()
+	end)
+	update()
+	table.insert(updaters, update)
+end
+
+local function newCycle(page, text, getText, nextValue)
+	local button = newButton(newRow(page, text), 120)
+	local function update()
+		button.Text = getText() .. "  ▶"
+	end
+	button.MouseButton1Click:Connect(function()
+		nextValue()
+		update()
+		refresh()
+	end)
+	update()
+	table.insert(updaters, update)
+end
+
+local function newColorPicker(page, text, key)
+	newCycle(page, text, function()
+		return COLORS[settings[key]].name
+	end, function()
+		settings[key] = settings[key] % #COLORS + 1
+	end)
+end
+
+-- One option of a group: only one option of the group can be active
+local function newOption(page, text, key, value, onSelect)
+	local button = newButton(newRow(page, text), 90)
+	local function update()
+		local active = settings[key] == value
+		button.Text = active and "ACTIVE" or "USE"
+		button.BackgroundColor3 = active and GREEN or NEUTRAL
+	end
+	button.MouseButton1Click:Connect(function()
+		if settings[key] == value then return end
+		settings[key] = value
+		redrawAll()
+		refresh()
+		if onSelect then onSelect() end
+	end)
+	update()
+	table.insert(updaters, update)
+end
+
+-- Tab: ESP Doors [Halloween]
+local doorPage = newTab("ESP Doors [Halloween]", 1)
+newToggle(doorPage, "Door ESP", "doorEspEnabled")
+newToggle(doorPage, "Door Counter", "counterEnabled")
+newToggle(doorPage, "Tracers", "doorTracersEnabled")
+newToggle(doorPage, "Show Distance", "doorDistanceEnabled")
+newToggle(doorPage, "Highlight Nearest Door", "nearestEnabled")
+newToggle(doorPage, "Notify New Doors", "notifyEnabled")
+newColorPicker(doorPage, "Door Color", "doorColorIndex")
+
+-- Tab: Items
+local itemPage = newTab("Items", 2)
+newToggle(itemPage, "Item ESP", "itemEspEnabled")
+newToggle(itemPage, "Names + Distance", "itemNamesEnabled")
+newToggle(itemPage, "Item Tracers", "itemTracersEnabled")
+newToggle(itemPage, "Item Counter", "itemCounterEnabled")
+newColorPicker(itemPage, "Item Color", "itemColorIndex")
+
+-- Tab: Instant Prompt
+local promptPage = newTab("Instant Prompt", 3)
+newOption(promptPage, "Instant Prompt", "instantPromptEnabled", true, function()
+	notify("⚡ Instant Prompt ON (" .. countPrompts() .. " prompts)")
+end)
+newOption(promptPage, "No Instant Prompt", "instantPromptEnabled", false, function()
+	notify("⏳ Prompts back to normal (" .. countPrompts() .. " prompts)")
+end)
+newInfo(promptPage, "ℹ Also works for prompts that appear later.")
+
+---------------------------------------------------------------------
+-- Tab: Players (Client-seitig für offline / Studio-Tests)
+---------------------------------------------------------------------
+local playersPage = newTab("Players", 4)
+do
+    local playerSettings = {
+        Highlights = false,
+        NameTags = false,
+        ShowHealth = false,
+        TeamColors = false,
+    }
+
+    local PLAYER_OPTIONS = {
+        { key = "Highlights", text = "Player Highlights" },
+        { key = "NameTags", text = "Name Tags" },
+        { key = "ShowHealth", text = "Show Health" },
+        { key = "TeamColors", text = "Team Colors" },
+    }
+
+    local function updatePlayerVisuals()
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player and plr.Character then
+                local char = plr.Character
+                
+                -- 1. Highlight Handling
+                local highlight = char:FindFirstChild("PlayerESPHighlight")
+                if playerSettings.Highlights then
+                    if not highlight then
+                        highlight = Instance.new("Highlight")
+                        highlight.Name = "PlayerESPHighlight"
+                        highlight.Adornee = char
+                        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        highlight.FillTransparency = 0.5
+                        highlight.OutlineTransparency = 0
+                        highlight.Parent = char
+                    end
+                    highlight.Enabled = true
+                    if playerSettings.TeamColors and plr.Team then
+                        highlight.FillColor = plr.Team.TeamColor.Color
+                        highlight.OutlineColor = plr.Team.TeamColor.Color
+                    else
+                        highlight.FillColor = Color3.fromRGB(60, 140, 255)
+                        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    end
+                elseif highlight then
+                    highlight.Enabled = false
+                end
+
+                -- 2. NameTag & Health BillboardGui Handling
+                local head = char:FindFirstChild("Head")
+                local billboard = char:FindFirstChild("PlayerESPBillboard")
+                
+                if (playerSettings.NameTags or playerSettings.ShowHealth) and head then
+                    if not billboard then
+                        billboard = Instance.new("BillboardGui")
+                        billboard.Name = "PlayerESPBillboard"
+                        billboard.Size = UDim2.fromOffset(150, 40)
+                        billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+                        billboard.AlwaysOnTop = true
+                        billboard.Adornee = head
+                        billboard.Parent = char
+
+                        local textLabel = Instance.new("TextLabel")
+                        textLabel.Name = "InfoText"
+                        textLabel.Size = UDim2.fromScale(1, 1)
+                        textLabel.BackgroundTransparency = 1
+                        textLabel.TextStrokeTransparency = 0.3
+                        styleText(textLabel, 13)
+                        textLabel.Parent = billboard
+                    end
+                    
+                    billboard.Enabled = true
+                    local textLabel = billboard:FindFirstChild("InfoText")
+                    local humanoid = char:FindFirstChildOfClass("Humanoid")
+                    
+                    if textLabel and humanoid then
+                        local textParts = {}
+                        if playerSettings.NameTags then
+                            table.insert(textParts, plr.Name)
+                        end
+                        if playerSettings.ShowHealth then
+                            table.insert(textParts, "❤ " .. math.floor(humanoid.Health))
+                        end
+                        textLabel.Text = table.concat(textParts, " ")
+                    end
+                elseif billboard then
+                    billboard.Enabled = false
+                end
+            end
+        end
+    end
+
+    for _, option in ipairs(PLAYER_OPTIONS) do
+        local row = newRow(playersPage, option.text)
+        local button = newButton(row, 70)
+        
+        local function refreshButton()
+            local active = playerSettings[option.key]
+            button.Text = active and "ON" or "OFF"
+            button.BackgroundColor3 = active and GREEN or RED
+        end
+
+        button.MouseButton1Click:Connect(function()
+            playerSettings[option.key] = not playerSettings[option.key]
+            refreshButton()
+            updatePlayerVisuals()
+        end)
+        
+        refreshButton()
+    end
+
+    newInfo(playersPage, "ℹ Funktioniert lokal im Testmodus / Offline-Spiel.")
+
+    -- Regelmäßiges Aktualisieren der Spieler-Visuals im RenderStepped oder via Schleife
+    RunService.RenderStepped:Connect(function()
+        if playerSettings.Highlights or playerSettings.NameTags or playerSettings.ShowHealth then
+            updatePlayerVisuals()
+        end
+    end)
+end
+
+-- Tab: Settings
+local settingsPage = newTab("Settings", 5)
+local waitingForKey = false
+do
+	local button = newButton(newRow(settingsPage, "Menu Key"), 130)
+	local function update()
+		button.Text = waitingForKey and "Press a key..." or settings.menuKey
+	end
+	button.MouseButton1Click:Connect(function()
+		waitingForKey = true
+		update()
+	end)
+	update()
+	table.insert(updaters, update)
+end
+do
+	local button = newButton(newRow(settingsPage, "Reset Everything"), 130)
+	button.Text = "Reset"
+	button.BackgroundColor3 = RED
+	button.MouseButton1Click:Connect(function()
+		for key, value in pairs(DEFAULTS) do
+			settings[key] = value
+		end
+		redrawAll()
+		refresh()
+		notify("Settings reset")
+	end)
+end
+newInfo(settingsPage, "ℹ Settings reset when you rejoin. Edit DEFAULTS at the top of the script to change the starting values.")
+
+showTab("ESP Doors [Halloween]")
+refresh()
+
+---------------------------------------------------------------------
+-- Keyboard
+---------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if waitingForKey and input.UserInputType == Enum.UserInputType.Keyboard then
+		waitingForKey = false
+		settings.menuKey = input.KeyCode.Name
+		redrawAll()
+		return
+	end
+	if gameProcessed then return end
+	if input.KeyCode.Name == settings.menuKey then
+		toggleMenu()
+	end
+end)
+
+---------------------------------------------------------------------
+-- Every frame: highlights, labels, tracers, counter
+---------------------------------------------------------------------
+RunService.RenderStepped:Connect(function()
+	local camera = workspace.CurrentCamera
+	local viewport = camera.ViewportSize
+
+	local origin
+	if settings.tracerOrigin == "Bottom" then
+		origin = Vector2.new(viewport.X / 2, viewport.Y - 5)
+	elseif settings.tracerOrigin == "Top" then
+		origin = Vector2.new(viewport.X / 2, 5)
+	elseif settings.tracerOrigin == "Mouse" then
+		origin = UserInputService:GetMouseLocation()
+	else
+		origin = viewport / 2
+	end
+
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local myPos = root and root.Position or camera.CFrame.Position
+
+	local doorColor = COLORS[settings.doorColorIndex].color
+	local itemColor = COLORS[settings.itemColorIndex].color
+
+	-- Positions & distances
+	local doorCount, itemCount = 0, 0
+	local nearestDoor, nearestDist = nil, math.huge
+	local itemList = {}
+	for obj, data in pairs(targets) do
+		data.pos = getPosition(obj)
+		data.dist = data.pos and (data.pos - myPos).Magnitude or math.huge
+		if data.kind == "door" then
+			doorCount += 1
+			if data.dist < nearestDist then
+				nearestDoor, nearestDist = obj, data.dist
+			end
+		else
+			itemCount += 1
+			table.insert(itemList, data)
+		end
+	end
+
+	-- Only the closest items get a highlight (Roblox limit)
+	table.sort(itemList, function(a, b) return a.dist < b.dist end)
+	for i, data in ipairs(itemList) do
+		data.highlight.Enabled = settings.itemEspEnabled and i <= MAX_ITEM_HIGHLIGHTS
+	end
+
+	for obj, data in pairs(targets) do
+		-- Never mark anything attached to a player
+		if isOnPlayer(obj) then
+			removeTarget(obj)
+			continue
+		end
+
+		local isDoor = data.kind == "door"
+		local isNearest = isDoor and settings.nearestEnabled and obj == nearestDoor
+
+		local color
+		if isNearest then
+			color = NEAREST_COLOR
+		elseif isDoor then
+			color = doorColor
+		else
+			color = itemColor
+		end
+
+		-- Highlight
+		if isDoor then
+			data.highlight.Enabled = settings.doorEspEnabled
+		end
+		if not data.highlight.Adornee then
+			data.highlight.Adornee = getPart(obj)
+		end
+		if data.highlight.FillColor ~= color then
+			data.highlight.FillColor = color
+			data.highlight.OutlineColor = color
+		end
+		if data.highlight.FillTransparency ~= settings.fillTransparency then
+			data.highlight.FillTransparency = settings.fillTransparency
+		end
+
+		-- Label above the object
+		local showLabel, showTracer
+		if isDoor then
+			showLabel = settings.doorDistanceEnabled
+			showTracer = settings.doorTracersEnabled
+		else
+			showLabel = settings.itemEspEnabled and settings.itemNamesEnabled
+			showTracer = settings.itemEspEnabled and settings.itemTracersEnabled
+		end
+
+		data.billboard.Enabled = showLabel and data.pos ~= nil
+		if showLabel and data.pos then
+			if not data.billboard.Adornee then
+				data.billboard.Adornee = getPart(obj)
+			end
+			local studs = math.floor(data.dist) .. " studs"
+			data.label.Text = isDoor and studs or (obj.Name .. " (" .. studs .. ")")
+			data.label.TextColor3 = color
+		end
+
+		-- Tracer
+		if showTracer and data.pos then
+			local thickness = settings.tracerThickness + (isNearest and 2 or 0)
+			drawTracer(data.tracer, camera, viewport, origin, data.pos, color, thickness)
+		else
+			data.tracer.Visible = false
+		end
+	end
+
+	-- Counter on the left
+	if counter.Visible then
+		local lines = {}
+		if settings.counterEnabled then
+			table.insert(lines, "🚪 Doors: " .. doorCount)
+			if nearestDoor then
+				table.insert(lines, "📍 Nearest: " .. math.floor(nearestDist) .. " studs")
+			end
+		end
+		if settings.itemEspEnabled and settings.itemCounterEnabled then
+			table.insert(lines, "📦 Items: " .. itemCount)
+		end
+		counter.Text = table.concat(lines, "\n")
+	end
+end)
+
+---------------------------------------------------------------------
+-- Find doors (Workspace.Effects)
+---------------------------------------------------------------------
+task.spawn(function()
+	local effects = workspace:WaitForChild("Effects", 15)
+	if not effects then
+		warn("[ESP] Workspace.Effects not found!")
+		return
+	end
+
+	local function checkDoor(obj)
+		if obj.Name == DOOR_NAME and obj:IsA("PVInstance") then
+			addTarget(obj, "door")
+		end
+	end
+
+	for _, obj in ipairs(effects:GetChildren()) do
+		checkDoor(obj)
+	end
+	effects.ChildAdded:Connect(checkDoor)
+	effects.ChildRemoved:Connect(removeTarget)
+
+	doorScanDone = true
+	print("[ESP] Doors ready.")
+end)
+
+---------------------------------------------------------------------
+-- Find items (Workspace.Items)
+---------------------------------------------------------------------
+task.spawn(function()
+	local folder
+	local startTime = os.clock()
+	while not folder and os.clock() - startTime < 15 do
+		for _, name in ipairs(ITEM_FOLDER_NAMES) do
+			folder = folder or workspace:FindFirstChild(name)
+		end
+		if not folder then task.wait(0.5) end
+	end
+
+	if not folder then
+		warn("[ESP] Workspace.Items not found!")
+		return
+	end
+
+	for _, obj in ipairs(folder:GetChildren()) do
+		addTarget(obj, "item")
+	end
+	folder.ChildAdded:Connect(function(obj)
+		addTarget(obj, "item")
+	end)
+	folder.ChildRemoved:Connect(removeTarget)
+
+	print("[ESP] Items ready.")
+end)
